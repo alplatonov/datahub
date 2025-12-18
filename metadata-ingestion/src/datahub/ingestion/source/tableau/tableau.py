@@ -21,7 +21,7 @@ from typing import (
     Union,
     cast,
 )
-from urllib.parse import quote, urlparse
+from urllib.parse import quote
 
 import dateutil.parser as dp
 import tableauserverclient as TSC
@@ -110,6 +110,7 @@ from datahub.ingestion.source.tableau.tableau_common import (
     get_unique_custom_sql,
     make_filter,
     make_fine_grained_lineage_class,
+    make_hostname_port,
     make_upstream_class,
     optimize_query_filter,
     published_datasource_graphql_query,
@@ -1163,24 +1164,29 @@ class TableauSiteSource:
         logger.debug("Tableau stats %s", self.tableau_stat_registry)
 
     def _populate_database_server_hostname_map(self) -> None:
-        def maybe_parse_hostname():
-            # If the connection string is a URL instead of a hostname, parse it
-            # and extract the hostname, otherwise just return the connection string.
-            parsed_host_name = urlparse(server_connection).hostname
-            if parsed_host_name:
-                return parsed_host_name
-            return server_connection
-
         for database_server in self.get_connection_objects(
             query=database_servers_graphql_query,
             connection_type=c.DATABASE_SERVERS_CONNECTION,
             page_size=self.config.effective_database_server_page_size,
         ):
+            logger.debug(f"Found database server {database_server}")
             database_server_id = database_server.get(c.ID)
-            server_connection = database_server.get(c.HOST_NAME)
-            host_name = maybe_parse_hostname()
-            if host_name:
-                self.database_server_hostname_map[str(database_server_id)] = host_name
+            hostname = database_server.get(c.HOST_NAME)
+            port = database_server.get(c.PORT)
+
+            logger.debug(
+                f'Tableau returned hostName="{hostname}" and port={port} '
+                f'for database server "{database_server_id}"'
+            )
+
+            hostname_key = make_hostname_port(hostname, port)
+            if hostname_key:
+                self.database_server_hostname_map[str(database_server_id)] = (
+                    hostname_key
+                )
+                logger.debug(
+                    f"Stored in database_server_hostname_map: {database_server_id} -> {hostname_key}"
+                )
 
     def _get_all_project(self) -> Dict[str, TableauProject]:
         all_project_map: Dict[str, TableauProject] = {}
@@ -1768,11 +1774,19 @@ class TableauSiteSource:
             )
             upstream_tables.extend(upstreams)
             table_id_to_urn.update(id_to_urn)
+            logger.debug(
+                f"List of upstream_tables after get_upstream_tables: {upstream_tables} for "
+                f"datasource {datasource.get(c.NAME)}"
+            )
 
             # This adds an edge to upstream CustomSQLTables using `fields`.`upstreamColumns`.`table`
             csql_upstreams, csql_id_to_urn = self.get_upstream_csql_tables(
                 datasource.get(c.FIELDS) or [],
             )
+            logger.debug(
+                f"List of csql upstream_tables: {csql_upstreams} for datasource {datasource.get(c.NAME)}"
+            )
+
             upstream_tables.extend(csql_upstreams)
             table_id_to_urn.update(csql_id_to_urn)
 
@@ -1935,6 +1949,7 @@ class TableauSiteSource:
                 self.config.database_hostname_to_platform_instance_map,
                 self.database_server_hostname_map,
             )
+            logger.info(f"Created table_urn: {table_urn} for table {table.get(c.ID)}")
             table_id_to_urn[table[c.ID]] = table_urn
 
             upstream_table = Upstream(
@@ -1958,7 +1973,13 @@ class TableauSiteSource:
                 self.database_tables[table_urn].update_table(
                     table[c.ID], num_tbl_cols, table_path
                 )
-
+        if upstream_tables:
+            for ut in upstream_tables:
+                logger.info(f"  - {ut.dataset}")
+        else:
+            logger.warning(
+                f"No upstream tables found for datasource '{datasource_name}'!"
+            )
         return upstream_tables, table_id_to_urn
 
     def get_upstream_columns_of_fields_in_datasource(
@@ -2166,7 +2187,11 @@ class TableauSiteSource:
                 urn=csql_urn,
                 aspects=[self.get_data_platform_instance()],
             )
-            logger.debug(f"Processing custom sql = {csql}")
+            logger.debug(f"alplatonov Processing custom sql = {csql}")
+            logger.info(
+                f"Processing Custom SQL: id={csql_id}, name={csql.get(c.NAME)}, "
+                f"isUnsupportedCustomSql={csql.get(c.IS_UNSUPPORTED_CUSTOM_SQL)}"
+            )
 
             datasource_name = None
             project = None
@@ -2223,7 +2248,6 @@ class TableauSiteSource:
                     if c.COLUMNS in csql and csql.get(c.COLUMNS) is not None
                     else []
                 )
-
                 tableau_table_list = csql.get(c.TABLES, [])
                 if self.config.force_extraction_of_lineage_from_custom_sql_queries or (
                     not tableau_table_list
@@ -2242,6 +2266,15 @@ class TableauSiteSource:
                         # only use our own.
                         logger.debug("Parsing TLL & CLL from custom sql (forced)")
 
+                    # Debug: только Custom SQL queries для casino_platform_v3_sf с isUnsupportedCustomSql=True
+                    debug_ids = [
+                        " ",  # Custom SQL Query7
+                        "cb7df5a2-b330-e833-6639-1a50029d5747",  # Custom SQL Query6
+                    ]
+                    if csql_id in debug_ids:
+                        logger.debug(f"alplatonov DEBUG: Processing csql_id={csql_id}")
+                    else:
+                        continue
                     yield from self._create_lineage_from_unsupported_csql(
                         csql_urn, csql, columns
                     )
@@ -2507,10 +2540,87 @@ class TableauSiteSource:
     ) -> Optional["SqlParsingResult"]:
         database_field = datasource.get(c.DATABASE) or {}
         database_id: Optional[str] = database_field.get(c.ID)
-        database_name: Optional[str] = database_field.get(c.NAME) or c.UNKNOWN.lower()
+        database_name: Optional[str] = database_field.get(c.NAME)
         database_connection_type: Optional[str] = database_field.get(
             c.CONNECTION_TYPE
         ) or datasource.get(c.CONNECTION_TYPE)
+        logger.debug(f"From tableau api database_name = {database_name}, ")
+
+        # Fallback: if database is None, try to extract from upstreamTables
+        default_schema: Optional[str] = None
+        if database_name is None or database_id is None:
+            logger.debug("Fallback: trying to extract database from upstreamTables")
+
+            upstream_tables = []
+
+            # EXPLICIT CHECK: For unsupported Custom SQL, Tableau doesn't parse the query
+            # and doesn't populate 'tables' field. Instead, it provides a reference to
+            # the published datasource in 'datasources' field.
+            if datasource.get(c.IS_UNSUPPORTED_CUSTOM_SQL) is True:
+                logger.debug(
+                    "Custom SQL is unsupported by Tableau parser (isUnsupportedCustomSql=True). "
+                    "Extracting database info from upstream published datasource."
+                )
+                published_datasources = datasource.get(c.DATA_SOURCES, [])
+
+                if published_datasources:
+                    published_ds = published_datasources[0]
+                    upstream_tables = published_ds.get(c.UPSTREAM_TABLES, [])
+                    logger.debug(
+                        f"Found {len(upstream_tables)} upstream tables in published datasource "
+                        f'"{published_ds.get(c.NAME)}" (id: {published_ds.get(c.ID)})'
+                    )
+                else:
+                    logger.warning(
+                        "isUnsupportedCustomSql=True but no upstream datasources found. "
+                        "Cannot extract database information for lineage."
+                    )
+            else:
+                # Tableau successfully parsed the SQL - use direct 'tables' field
+                upstream_tables = datasource.get(c.TABLES, [])
+
+            if upstream_tables:
+                upstream_db = upstream_tables[0].get(c.DATABASE, {})
+                if database_name is None:
+                    # Database ID is same as DatabaseServer ID in Tableau's metadata model
+                    # Use it to lookup hostName:port from database_server_hostname_map
+                    upstream_db_id = upstream_db.get(c.ID)
+                    if (
+                        upstream_db_id
+                        and upstream_db_id in self.database_server_hostname_map
+                    ):
+                        database_name = self.database_server_hostname_map[
+                            upstream_db_id
+                        ]
+                        logger.debug(
+                            f"Found database name '{database_name}' in database_server_hostname_map "
+                            f"for database ID {upstream_db_id}"
+                        )
+                    else:
+                        # Fallback to name only if not found in map
+                        # database.name is user-defined and unreliable (e.g., "workgroup", "tableaudata")
+                        database_name = upstream_db.get(c.NAME)
+                        logger.warning(
+                            f"Database ID {upstream_db_id} not found in database_server_hostname_map. "
+                            f"Using database.name='{database_name}' as fallback. "
+                            f"This may cause incorrect platform_instance resolution."
+                        )
+
+                if database_id is None:
+                    database_id = upstream_db.get(c.ID)
+
+                if database_connection_type is None:
+                    database_connection_type = upstream_db.get(c.CONNECTION_TYPE)
+
+                # Extract default_schema for SQL parsing
+                default_schema = upstream_tables[0].get(c.SCHEMA)
+
+                logger.debug(
+                    f"Extracted database from upstreamTables: database name={database_name}, id={database_id}, "
+                    f"connectionType={database_connection_type}, schema={default_schema}"
+                )
+            else:
+                logger.debug(f"No upstreamTables found in datasource {datasource_urn}")
 
         if (
             datasource.get(c.IS_UNSUPPORTED_CUSTOM_SQL) in (None, False)
@@ -2559,6 +2669,7 @@ class TableauSiteSource:
             platform=platform,
             platform_instance=platform_instance,
             env=env,
+            default_schema=default_schema,
             graph=self.ctx.graph,
             schema_aware=not self.config.sql_parsing_disable_schema_awareness,
         )
@@ -2567,16 +2678,120 @@ class TableauSiteSource:
 
         if parsed_result.debug_info.table_error:
             logger.warning(
-                f"Failed to extract table lineage from datasource {datasource_urn}: {parsed_result.debug_info.table_error}"
+                f"Failed to extract table lineage from datasource {datasource_urn}: "
+                f"{parsed_result.debug_info.table_error}"
             )
             self.report.num_upstream_table_lineage_failed_parse_sql += 1
         elif parsed_result.debug_info.column_error:
             logger.warning(
-                f"Failed to extract column level lineage from datasource {datasource_urn}: {parsed_result.debug_info.column_error}"
+                f"Failed to extract column level lineage from datasource {datasource_urn}: "
+                f"{parsed_result.debug_info.column_error}"
             )
             self.report.num_upstream_fine_grained_lineage_failed_parse_sql += 1
 
         return parsed_result
+
+    # def parse_custom_sql(
+    #     self,
+    #     datasource: dict,
+    #     datasource_urn: str,
+    #     platform: str,
+    #     env: str,
+    #     platform_instance: Optional[str],
+    #     func_overridden_info: Optional[
+    #         Callable[
+    #             [
+    #                 str,
+    #                 Optional[str],
+    #                 Optional[str],
+    #                 Optional[Dict[str, str]],
+    #                 Optional[TableauLineageOverrides],
+    #                 Optional[Dict[str, str]],
+    #                 Optional[Dict[str, str]],
+    #             ],
+    #             Tuple[Optional[str], Optional[str], str, str],
+    #         ]
+    #     ],
+    # ) -> Optional["SqlParsingResult"]:
+    #
+    #     database_field = datasource.get(c.DATABASE) or {}
+    #     database_id: Optional[str] = database_field.get(c.ID)
+    #     database_name: Optional[str] = database_field.get(c.NAME) or c.UNKNOWN.lower()
+    #     database_connection_type: Optional[str] = database_field.get(
+    #         c.CONNECTION_TYPE
+    #     ) or datasource.get(c.CONNECTION_TYPE)
+    #     logger.debug(f"database_name from metadata api tableau: {database_name}, ")
+    #
+    #     if c.ID == '0851f191-d165-30ee-d0fd-d0959c7ee01e':
+    #         print("alplatonov id test2")
+    #
+    #     if (
+    #         datasource.get(c.IS_UNSUPPORTED_CUSTOM_SQL) in (None, False)
+    #         and not self.config.force_extraction_of_lineage_from_custom_sql_queries
+    #     ):
+    #         logger.debug(f"datasource {datasource_urn} is not created from custom sql")
+    #         return None
+    #
+    #     if database_connection_type is None:
+    #         logger.debug(
+    #             f"database information is missing from datasource {datasource_urn}"
+    #         )
+    #         return None
+    #
+    #     query = datasource.get(c.QUERY)
+    #     if query is None:
+    #         logger.debug(
+    #             f"raw sql query is not available for datasource {datasource_urn}"
+    #         )
+    #         return None
+    #     query = self._clean_tableau_query_parameters(query)
+    #
+    #     logger.debug(f"Parsing sql={query}")
+    #
+    #     upstream_db = database_name
+    #
+    #     if func_overridden_info is not None:
+    #         # Override the information as per configuration
+    #         upstream_db, platform_instance, platform, _ = func_overridden_info(
+    #             database_connection_type,
+    #             database_name,
+    #             database_id,
+    #             self.config.platform_instance_map,
+    #             self.config.lineage_overrides,
+    #             self.config.database_hostname_to_platform_instance_map,
+    #             self.database_server_hostname_map,
+    #         )
+    #
+    #     logger.debug(
+    #         f"Overridden info upstream_db={upstream_db}, platform_instance={platform_instance}, platform={platform}"
+    #     )
+    #
+    #     parsed_result = create_lineage_sql_parsed_result(
+    #         query=query,
+    #         default_db=upstream_db,
+    #         platform=platform,
+    #         platform_instance=platform_instance,
+    #         env=env,
+    #         graph=self.ctx.graph,
+    #         schema_aware=not self.config.sql_parsing_disable_schema_awareness,
+    #     )
+    #
+    #     assert parsed_result is not None
+    #
+    #     if parsed_result.debug_info.table_error:
+    #         logger.warning(
+    #             f"Failed to extract table lineage from datasource {datasource_urn}: "
+    #             f"{parsed_result.debug_info.table_error}"
+    #         )
+    #         self.report.num_upstream_table_lineage_failed_parse_sql += 1
+    #     elif parsed_result.debug_info.column_error:
+    #         logger.warning(
+    #             f"Failed to extract column level lineage from datasource {datasource_urn}: "
+    #             f"{parsed_result.debug_info.column_error}"
+    #         )
+    #         self.report.num_upstream_fine_grained_lineage_failed_parse_sql += 1
+    #
+    #     return parsed_result
 
     def _enrich_database_tables_with_parsed_schemas(
         self, parsing_result: SqlParsingResult
@@ -2911,7 +3126,12 @@ class TableauSiteSource:
                 field_upstream_query=datasource_upstream_fields_graphql_query,
                 page_size=self.config.effective_published_datasource_field_upstream_page_size,
             )
+            # if datasource.get('name') == 'casino_platform_v3_sf (Alex)':
 
+            # if datasource.get('name') == 'teamtailor_v2':
+            #     print(datasource)
+            # else:
+            #     continue
             yield from self.emit_datasource(datasource)
 
     def emit_upstream_tables(self) -> Iterable[MetadataWorkUnit]:

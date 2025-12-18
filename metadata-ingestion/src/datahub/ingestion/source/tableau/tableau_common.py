@@ -394,19 +394,19 @@ published_datasource_graphql_query = """
         description
         isHidden
         folderName
-        # upstreamFields {
-        #     name
-        #     datasource {
-        #         id
-        #     }
-        # }
-        # upstreamColumns {
-        #     name
-        #     table {
-        #         __typename
-        #         id
-        #     }
-        # }
+        upstreamFields {
+            name
+            datasource {
+                id
+            }
+        }
+        upstreamColumns {
+            name
+            table {
+                __typename
+                id
+            }
+        }
         ... on ColumnField {
             dataCategory
             role
@@ -457,6 +457,9 @@ database_servers_graphql_query = """
     connectionType
     extendedConnectionType
     hostName
+    port
+    service
+    description
 }
 """
 
@@ -796,26 +799,83 @@ def get_overridden_info(
     platform_instance = (
         platform_instance_map.get(original_platform) if platform_instance_map else None
     )
+    logger.debug(
+        f"[get_overridden_info] platform_instance from platform_instance_map: {platform_instance}"
+    )
+    logger.debug(
+        f"[get_overridden_info] database_server_hostname_map: {database_server_hostname_map}"
+    )
+    logger.debug(
+        f"[get_overridden_info] database_hostname_to_platform_instance_map: {database_hostname_to_platform_instance_map}"
+    )
+
     if (
         database_server_hostname_map is not None
         and upstream_db_id is not None
         and upstream_db_id in database_server_hostname_map
     ):
-        hostname = database_server_hostname_map.get(upstream_db_id)
-        if (
-            database_hostname_to_platform_instance_map is not None
-            and hostname in database_hostname_to_platform_instance_map
-        ):
-            platform_instance = database_hostname_to_platform_instance_map.get(hostname)
+        hostname_with_port = database_server_hostname_map.get(upstream_db_id)
+        logger.debug(
+            f"[get_overridden_info] Found hostname in database_server_hostname_map: {hostname_with_port}"
+        )
+
+        if database_hostname_to_platform_instance_map is not None:
+            # Try exact match first (hostname:port)
+            if hostname_with_port in database_hostname_to_platform_instance_map:
+                platform_instance = database_hostname_to_platform_instance_map.get(
+                    hostname_with_port
+                )
+                logger.debug(
+                    f"[get_overridden_info] Found exact match for '{hostname_with_port}' -> platform_instance: {platform_instance}"
+                )
+            else:
+                # Fallback: try hostname without port for backward compatibility
+                hostname_without_port = (
+                    hostname_with_port.split(":")[0]
+                    if ":" in hostname_with_port
+                    else hostname_with_port
+                )
+                if hostname_without_port in database_hostname_to_platform_instance_map:
+                    platform_instance = database_hostname_to_platform_instance_map.get(
+                        hostname_without_port
+                    )
+                    logger.warning(
+                        f"[get_overridden_info] Using fallback mapping for hostname '{hostname_without_port}' "
+                        f"(original: '{hostname_with_port}'). This may cause incorrect platform_instance assignment "
+                        f"when multiple database servers share the same hostname but use different ports. "
+                        f"Tableau API always provides port information. "
+                        f"Please update your configuration to use the full 'hostname:port' format: "
+                        f'database_hostname_to_platform_instance_map["{hostname_with_port}"] = "{platform_instance}"'
+                    )
+                else:
+                    logger.debug(
+                        f"[get_overridden_info] hostname '{hostname_with_port}' "
+                        f"(and fallback '{hostname_without_port}') "
+                        f"not found in database_hostname_to_platform_instance_map"
+                    )
+        else:
+            logger.debug(
+                "[get_overridden_info] database_hostname_to_platform_instance_map is None"
+            )
+    else:
+        logger.debug(
+            f"[get_overridden_info] upstream_db_id {upstream_db_id} not found in database_server_hostname_map"
+        )
 
     if original_platform in (
         "athena",
         "hive",
         "mysql",
         "teradata",
+        "clickhouse",
     ):  # Two tier databases
         upstream_db = None
 
+    logger.debug(
+        f"[get_overridden_info] RESULT: upstream_db={upstream_db}, "
+        f"platform_instance={platform_instance}, "
+        f"platform={platform}"
+    )
     return upstream_db, platform_instance, platform, original_platform
 
 
@@ -844,6 +904,50 @@ def make_upstream_class(
             UpstreamClass(type=DatasetLineageType.TRANSFORMED, dataset=dataset_urn)
         )
     return upstream_tables
+
+
+def make_hostname_port(
+    hostname: Optional[str],
+    port: Optional[int],
+) -> Optional[str]:
+    """
+    Construct hostname:port string from Tableau API database fields.
+
+    This function handles various hostname formats (URLs, JDBC strings, plain hostnames)
+    and combines them with port information consistently.
+
+    Args:
+        hostname: The hostName field from Tableau API (may be URL, JDBC string, or plain hostname)
+        port: The port field from Tableau API
+
+    Returns:
+        - "hostname:port" if both hostname and valid port are provided
+        - "hostname" if only hostname is provided (port is None, 0, or negative)
+        - None if hostname is empty/None
+
+    Examples:
+        make_hostname_port("127.0.0.1", 8081) -> "127.0.0.1:8081"
+        make_hostname_port("https://bigquery.googleapis.com/v2", 443) -> "bigquery.googleapis.com:443"
+        make_hostname_port("jdbc:mysql://db.local/warehouse", 3306) -> "db.local:3306"
+        make_hostname_port("postgres.local", None) -> "postgres.local"
+        make_hostname_port("", 5432) -> None
+    """
+    from urllib.parse import urlparse
+
+    if not hostname:
+        return None
+
+    # Parse hostname to handle URLs (http://, https://, jdbc://, etc.)
+    parsed_hostname = urlparse(hostname).hostname
+    if parsed_hostname:
+        hostname = parsed_hostname
+    # else: hostname is already a plain hostname, use as is
+
+    # Append port if valid
+    if port and port > 0:
+        return f"{hostname}:{port}"
+
+    return hostname
 
 
 def make_fine_grained_lineage_class(
